@@ -1,0 +1,8 @@
+# Keep this public repository intentionally minimal.
+# Only the dashboard, deployment workflow, and this allowlist are committed.
+*
+!.gitignore
+!Noemi_Dashboard.html
+!.github/
+!.github/workflows/
+!.github/workflows/deploy-dashboard.yml
