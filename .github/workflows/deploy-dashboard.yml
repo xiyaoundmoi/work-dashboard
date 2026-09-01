@@ -74,7 +74,8 @@ jobs:
             const expected = target == null ? null : period === 'Weekly' ? Math.min(target, target * Math.min(weekday, 5) / 5) : Math.min(target, target * day / daysInMonth);
             let status = 'Awaiting current-period data';
             if (published != null && target != null) {
-              if (published >= target || published >= expected * 1.1) status = 'Ahead';
+              if (published >= target) status = 'Complete';
+              else if (published >= expected * 1.1) status = 'Ahead';
               else if (published >= expected * .9) status = 'On Track';
               else if (published >= expected * .8) status = 'Attention';
               else status = 'Behind';
@@ -83,22 +84,28 @@ jobs:
           };
           const live = current.map(progress).filter(row => row.active && row.isCurrent);
           const withData = live.filter(row => row.published != null && row.target != null);
+          const allReported = live.length > 0 && withData.length === live.length;
           const sum = key => withData.reduce((total, row) => total + row[key], 0);
-          const totalPublished = sum('published'), totalTarget = sum('target');
-          const overall = totalTarget ? totalPublished / totalTarget : null;
-          const onTrack = withData.filter(row => row.status === 'Ahead' || row.status === 'On Track').length;
-          const behind = withData.filter(row => row.status === 'Behind').length;
+          const totalPublished = sum('published');
+          const totalTarget = live.reduce((total, row) => total + (row.target || 0), 0);
+          const overall = allReported && totalTarget ? totalPublished / totalTarget : null;
+          const counts = Object.fromEntries(['On Track','Attention','Behind','Ahead','Complete'].map(status => [status, withData.filter(row => row.status === status).length]));
+          const awaiting = live.length - withData.length;
           const label = row => row.period === 'Weekly' ? `${row.target} / week` : `${row.target} / month`;
-          const statusClass = status => ({'Ahead':'ahead','On Track':'track','Attention':'attention','Behind':'behind'}[status] || 'routine');
+          const statusClass = status => ({'Ahead':'ahead','On Track':'track','Attention':'attention','Behind':'behind','Complete':'complete'}[status] || 'routine');
+          const urgency = {'Behind':0,'Attention':1,'On Track':2,'Ahead':3,'Complete':4,'Awaiting current-period data':5};
           const metric = (name, value, detail) => `<div class="metric-card"><div class="metric-label">${name}</div><div class="metric-value">${value}</div><div class="metric-detail">${detail}</div></div>`;
-          const liveRows = live.length ? live.map(row => {
+          const liveRows = live.length ? [...live].sort((a,b) => urgency[a.status] - urgency[b.status] || a.client.localeCompare(b.client) || a.platform.localeCompare(b.platform)).map(row => {
             const completion = row.published == null || row.target == null ? '—' : `${Math.round(row.published / row.target * 100)}%`;
             const width = row.published == null || row.target == null ? 0 : Math.min(100, row.published / row.target * 100);
-            const actual = row.published == null ? 'Awaiting current-period data' : row.published;
-            const expected = row.expected == null ? '—' : row.expected.toFixed(1);
-            return `<tr><td>${esc(row.client)}</td><td>${esc(row.platform)}</td><td>${esc(actual)}</td><td>${esc(label(row))}</td><td>${completion}<div class="progress-track"><div class="progress-fill ${statusClass(row.status)}" style="width:${width}%"></div></div></td><td>${expected}</td><td>${esc(row.owner)}</td><td><span class="tag ${statusClass(row.status)}">${esc(row.status)}</span></td></tr>`;
-          }).join('') : '<tr><td colspan="8" class="inactive">Awaiting current-period setup.</td></tr>';
-          const liveSection = `<section id="publishing-progress"><h2>Publishing Progress</h2><p class="section-note">Current weekly and monthly delivery only. Historical cumulative reporting appears below.</p><div class="kpi-grid">${metric('Total Posts Published', withData.length ? totalPublished : '—', withData.length ? 'Current reporting periods' : 'Awaiting current-period data')}${metric('Overall Completion %', overall == null ? '—' : `${Math.round(overall * 100)}%`, overall == null ? 'Awaiting current-period data' : 'Current reporting periods')}${metric('Platforms On Track', withData.length ? onTrack : '—', withData.length ? 'Ahead or on schedule' : 'Awaiting current-period data')}${metric('Platforms Behind', withData.length ? behind : '—', withData.length ? 'Below schedule' : 'Awaiting current-period data')}</div><div class="table-wrap"><table><thead><tr><th>Client</th><th>Platform</th><th>Published</th><th>Target</th><th>Completion</th><th>Expected</th><th>Owner</th><th>Status</th></tr></thead><tbody>${liveRows}</tbody></table></div></section>`;
+            const publishedTarget = row.published == null ? `— / ${row.target}` : `${row.published} / ${row.target}`;
+            return `<tr><td>${esc(row.client)}</td><td>${esc(row.platform)}</td><td>${completion}<div class="progress-track"><div class="progress-fill ${statusClass(row.status)}" style="width:${width}%"></div></div></td><td>${esc(publishedTarget)}</td><td>${esc(row.owner)}</td><td><span class="tag ${statusClass(row.status)}">${esc(row.status)}</span></td></tr>`;
+          }).join('') : '<tr><td colspan="6" class="inactive">Awaiting current-period setup.</td></tr>';
+          const progressWidth = overall == null ? 0 : Math.min(100, overall * 100);
+          const completionDisplay = overall == null ? '—' : `${Math.round(overall * 100)}%`;
+          const progressDetail = allReported ? `${totalPublished} / ${totalTarget} Posts` : `— / ${totalTarget} Posts · ${awaiting} awaiting data`;
+          const countDisplay = status => withData.length ? `${counts[status]} platforms` : '— platforms';
+          const liveSection = `<section id="publishing-progress"><h2>Publishing Progress</h2><p class="section-note">Current weekly and monthly delivery only. Historical cumulative reporting appears below.</p><div class="metric-card"><div class="metric-label">Overall Posting Progress</div><div class="metric-value">${completionDisplay}</div><div class="metric-detail">${progressDetail}</div><div class="overall-progress"><div class="progress-fill track" style="width:${progressWidth}%"></div></div></div><h3 style="font-size:13px;margin:18px 0 8px;">Status Summary</h3><div class="kpi-grid">${metric('On Track', countDisplay('On Track'), 'Meeting expected pace')}${metric('Attention', countDisplay('Attention'), 'Below expected pace')}${metric('Behind', countDisplay('Behind'), 'Needs follow-up')}${metric('Ahead', countDisplay('Ahead'), 'Ahead of expected pace')}</div><div class="table-wrap"><table><thead><tr><th>Client</th><th>Platform</th><th>Progress</th><th>Published / Target</th><th>Owner</th><th>Status</th></tr></thead><tbody>${liveRows}</tbody></table></div></section>`;
           const historyRows = historical.map(row => {
             const p = row.properties || {}, published = number(p.Published), target = number(p.Target);
             const completion = published == null || target == null ? '—' : `${Math.round(published / target * 100)}%`;
