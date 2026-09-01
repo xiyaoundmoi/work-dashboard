@@ -7,6 +7,8 @@ on:
       - Noemi_Dashboard.html
       - .github/workflows/deploy-dashboard.yml
   workflow_dispatch:
+  schedule:
+    - cron: '*/30 * * * *'
 
 permissions:
   contents: read
@@ -28,9 +30,87 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Prepare public site
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_PUBLISHING_READ_TOKEN }}
         run: |
           mkdir -p _site
           cp Noemi_Dashboard.html _site/index.html
+          if [ -z "$NOTION_TOKEN" ]; then
+            echo "NOTION_PUBLISHING_READ_TOKEN is not configured; publishing the safe placeholder."
+            exit 0
+          fi
+          curl --fail-with-body --silent --show-error \
+            -X POST 'https://api.notion.com/v1/data_sources/a20e0d46-3608-490a-8636-9cc8d4a68aae/query' \
+            -H "Authorization: Bearer $NOTION_TOKEN" \
+            -H 'Notion-Version: 2026-03-11' \
+            -H 'Content-Type: application/json' \
+            --data '{"page_size":100}' > current.json
+          curl --fail-with-body --silent --show-error \
+            -X POST 'https://api.notion.com/v1/data_sources/9c7b84ff-0454-4c6c-8c7c-396e3859c316/query' \
+            -H "Authorization: Bearer $NOTION_TOKEN" \
+            -H 'Notion-Version: 2026-03-11' \
+            -H 'Content-Type: application/json' \
+            --data '{"page_size":100}' > historical.json
+          node <<'NODE'
+          const fs = require('fs');
+          const current = JSON.parse(fs.readFileSync('current.json', 'utf8')).results || [];
+          const historical = JSON.parse(fs.readFileSync('historical.json', 'utf8')).results || [];
+          const esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+          const title = prop => (prop?.title || []).map(item => item.plain_text || '').join('');
+          const select = prop => prop?.select?.name || '';
+          const number = prop => prop?.number ?? null;
+          const date = prop => prop?.date?.start || '';
+          const china = new Intl.DateTimeFormat('en-CA', {timeZone:'Asia/Shanghai', year:'numeric', month:'2-digit', day:'2-digit', weekday:'short'}).formatToParts(new Date()).reduce((out, part) => (out[part.type] = part.value, out), {});
+          const year = Number(china.year), month = Number(china.month), day = Number(china.day);
+          const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
+          const weekday = {Mon:1, Tue:2, Wed:3, Thu:4, Fri:5, Sat:6, Sun:7}[china.weekday];
+          const todayMonth = `${china.year}-${china.month}-01`;
+          const monday = new Date(Date.UTC(year, month - 1, day - Math.min(weekday, 7) + 1)).toISOString().slice(0, 10);
+          const progress = row => {
+            const p = row.properties || {}, period = select(p['Posting Period']), label = date(p['Period Label']);
+            const isCurrent = period === 'Monthly' ? label === todayMonth : period === 'Weekly' && label === monday;
+            const active = select(p['Active / Inactive']) === 'Active';
+            const target = number(p.Target), published = number(p.Published);
+            const expected = target == null ? null : period === 'Weekly' ? Math.min(target, target * Math.min(weekday, 5) / 5) : Math.min(target, target * day / daysInMonth);
+            let status = 'Awaiting current-period data';
+            if (published != null && target != null) {
+              if (published >= target || published >= expected * 1.1) status = 'Ahead';
+              else if (published >= expected * .9) status = 'On Track';
+              else if (published >= expected * .8) status = 'Attention';
+              else status = 'Behind';
+            }
+            return {client:title(p.Client), platform:select(p.Platform), period, label, target, published, expected, status, owner:select(p.Owner) || '—', active, isCurrent};
+          };
+          const live = current.map(progress).filter(row => row.active && row.isCurrent);
+          const withData = live.filter(row => row.published != null && row.target != null);
+          const sum = key => withData.reduce((total, row) => total + row[key], 0);
+          const totalPublished = sum('published'), totalTarget = sum('target');
+          const overall = totalTarget ? totalPublished / totalTarget : null;
+          const onTrack = withData.filter(row => row.status === 'Ahead' || row.status === 'On Track').length;
+          const behind = withData.filter(row => row.status === 'Behind').length;
+          const label = row => row.period === 'Weekly' ? `${row.target} / week` : `${row.target} / month`;
+          const statusClass = status => ({'Ahead':'ahead','On Track':'track','Attention':'attention','Behind':'behind'}[status] || 'routine');
+          const metric = (name, value, detail) => `<div class="metric-card"><div class="metric-label">${name}</div><div class="metric-value">${value}</div><div class="metric-detail">${detail}</div></div>`;
+          const liveRows = live.length ? live.map(row => {
+            const completion = row.published == null || row.target == null ? '—' : `${Math.round(row.published / row.target * 100)}%`;
+            const width = row.published == null || row.target == null ? 0 : Math.min(100, row.published / row.target * 100);
+            const actual = row.published == null ? 'Awaiting current-period data' : row.published;
+            const expected = row.expected == null ? '—' : row.expected.toFixed(1);
+            return `<tr><td>${esc(row.client)}</td><td>${esc(row.platform)}</td><td>${esc(actual)}</td><td>${esc(label(row))}</td><td>${completion}<div class="progress-track"><div class="progress-fill ${statusClass(row.status)}" style="width:${width}%"></div></div></td><td>${expected}</td><td>${esc(row.owner)}</td><td><span class="tag ${statusClass(row.status)}">${esc(row.status)}</span></td></tr>`;
+          }).join('') : '<tr><td colspan="8" class="inactive">Awaiting current-period setup.</td></tr>';
+          const liveSection = `<section id="publishing-progress"><h2>Publishing Progress</h2><p class="section-note">Current weekly and monthly delivery only. Historical cumulative reporting appears below.</p><div class="kpi-grid">${metric('Total Posts Published', withData.length ? totalPublished : '—', withData.length ? 'Current reporting periods' : 'Awaiting current-period data')}${metric('Overall Completion %', overall == null ? '—' : `${Math.round(overall * 100)}%`, overall == null ? 'Awaiting current-period data' : 'Current reporting periods')}${metric('Platforms On Track', withData.length ? onTrack : '—', withData.length ? 'Ahead or on schedule' : 'Awaiting current-period data')}${metric('Platforms Behind', withData.length ? behind : '—', withData.length ? 'Below schedule' : 'Awaiting current-period data')}</div><div class="table-wrap"><table><thead><tr><th>Client</th><th>Platform</th><th>Published</th><th>Target</th><th>Completion</th><th>Expected</th><th>Owner</th><th>Status</th></tr></thead><tbody>${liveRows}</tbody></table></div></section>`;
+          const historyRows = historical.map(row => {
+            const p = row.properties || {}, published = number(p.Published), target = number(p.Target);
+            const completion = published == null || target == null ? '—' : `${Math.round(published / target * 100)}%`;
+            const range = p['Target Range']?.rich_text?.map(item => item.plain_text).join('') || '';
+            return `<tr><td>${esc(title(p.Client))}</td><td>${esc(select(p.Platform))}</td><td>${esc(date(p['Tracking Start']) || '—')}</td><td>${esc(date(p['Tracking End']) || '—')}</td><td>${esc(published ?? '—')}</td><td>${esc(target == null ? (range || '—') : target)}</td><td>${completion}</td></tr>`;
+          }).join('') || '<tr><td colspan="7" class="inactive">No historical publishing records available.</td></tr>';
+          const historySection = `<section id="historical-publishing-performance"><h2>Historical Publishing Performance</h2><p class="section-note">Cumulative contract and YTD reference data. It does not indicate current-period pace.</p><div class="table-wrap"><table><thead><tr><th>Client</th><th>Platform</th><th>Tracking Start</th><th>Tracking End</th><th>Published</th><th>Target</th><th>Completion</th></tr></thead><tbody>${historyRows}</tbody></table></div></section>`;
+          let html = fs.readFileSync('_site/index.html', 'utf8');
+          html = html.replace(/<section id="publishing-progress">[\s\S]*?<\/section>/, liveSection);
+          html = html.replace(/<section id="historical-publishing-performance">[\s\S]*?<\/section>/, historySection);
+          fs.writeFileSync('_site/index.html', html);
+          NODE
 
       - name: Upload site
         uses: actions/upload-pages-artifact@v3
