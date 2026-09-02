@@ -3,9 +3,7 @@ name: Deploy dashboard
 on:
   push:
     branches: [main]
-    paths:
-      - Noemi_Dashboard.html
-      - .github/workflows/deploy-dashboard.yml
+    paths: [Noemi_Dashboard.html, .github/workflows/deploy-dashboard.yml]
   workflow_dispatch:
   schedule:
     - cron: '*/30 * * * *'
@@ -26,9 +24,7 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
     steps:
-      - name: Check out dashboard
-        uses: actions/checkout@v4
-
+      - uses: actions/checkout@v4
       - name: Prepare public site
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_PUBLISHING_READ_TOKEN }}
@@ -39,91 +35,74 @@ jobs:
             echo "NOTION_PUBLISHING_READ_TOKEN is not configured; publishing the safe placeholder."
             exit 0
           fi
-          curl --fail-with-body --silent --show-error \
-            -X POST 'https://api.notion.com/v1/data_sources/a20e0d46-3608-490a-8636-9cc8d4a68aae/query' \
-            -H "Authorization: Bearer $NOTION_TOKEN" \
-            -H 'Notion-Version: 2026-03-11' \
-            -H 'Content-Type: application/json' \
-            --data '{"page_size":100}' > current.json
-          curl --fail-with-body --silent --show-error \
-            -X POST 'https://api.notion.com/v1/data_sources/9c7b84ff-0454-4c6c-8c7c-396e3859c316/query' \
-            -H "Authorization: Bearer $NOTION_TOKEN" \
-            -H 'Notion-Version: 2026-03-11' \
-            -H 'Content-Type: application/json' \
-            --data '{"page_size":100}' > historical.json
+          for source in \
+            a20e0d46-3608-490a-8636-9cc8d4a68aae:current \
+            9c7b84ff-0454-4c6c-8c7c-396e3859c316:historical \
+            b488f985-5854-4924-8bc0-007d0442d693:projects \
+            6c866113-529c-4257-b8d8-8be54ede12e5:workstreams; do
+            id="${source%%:*}"; file="${source##*:}.json"
+            curl --fail-with-body --silent --show-error -X POST "https://api.notion.com/v1/data_sources/$id/query" -H "Authorization: Bearer $NOTION_TOKEN" -H 'Notion-Version: 2026-03-11' -H 'Content-Type: application/json' --data '{"page_size":100}' > "$file"
+          done
           node <<'NODE'
           const fs = require('fs');
-          const current = JSON.parse(fs.readFileSync('current.json', 'utf8')).results || [];
-          const historical = JSON.parse(fs.readFileSync('historical.json', 'utf8')).results || [];
-          const esc = value => String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
-          const title = prop => (prop?.title || []).map(item => item.plain_text || '').join('');
-          const select = prop => prop?.select?.name || '';
-          const number = prop => prop?.number ?? null;
-          const date = prop => prop?.date?.start || '';
-          const china = new Intl.DateTimeFormat('en-CA', {timeZone:'Asia/Shanghai', year:'numeric', month:'2-digit', day:'2-digit', weekday:'short'}).formatToParts(new Date()).reduce((out, part) => (out[part.type] = part.value, out), {});
-          const year = Number(china.year), month = Number(china.month), day = Number(china.day);
-          const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
-          const weekday = {Mon:1, Tue:2, Wed:3, Thu:4, Fri:5, Sat:6, Sun:7}[china.weekday];
-          const todayMonth = `${china.year}-${china.month}-01`;
-          const monday = new Date(Date.UTC(year, month - 1, day - Math.min(weekday, 7) + 1)).toISOString().slice(0, 10);
-          const progress = row => {
-            const p = row.properties || {}, period = select(p['Posting Period']), label = date(p['Period Label']);
-            const isCurrent = period === 'Monthly' ? label === todayMonth : period === 'Weekly' && label === monday;
-            const active = select(p['Active / Inactive']) === 'Active';
-            const target = number(p.Target), published = number(p.Published);
-            const expected = target == null ? null : period === 'Weekly' ? Math.min(target, target * Math.min(weekday, 5) / 5) : Math.min(target, target * day / daysInMonth);
-            let status = 'Awaiting current-period data';
-            if (published != null && target != null) {
-              if (published >= target) status = 'Complete';
-              else if (published >= expected * 1.1) status = 'Ahead';
-              else if (published >= expected * .9) status = 'On Track';
-              else if (published >= expected * .8) status = 'Attention';
-              else status = 'Behind';
-            }
-            return {client:title(p.Client), platform:select(p.Platform), period, label, target, published, expected, status, owner:select(p.Owner) || '—', active, isCurrent};
-          };
-          const live = current.map(progress).filter(row => row.active && row.isCurrent);
-          const withData = live.filter(row => row.published != null && row.target != null);
-          const allReported = live.length > 0 && withData.length === live.length;
-          const sum = key => withData.reduce((total, row) => total + row[key], 0);
-          const totalPublished = sum('published');
-          const totalTarget = live.reduce((total, row) => total + (row.target || 0), 0);
-          const overall = allReported && totalTarget ? totalPublished / totalTarget : null;
-          const counts = Object.fromEntries(['On Track','Attention','Behind','Ahead','Complete'].map(status => [status, withData.filter(row => row.status === status).length]));
-          const awaiting = live.length - withData.length;
-          const label = row => row.period === 'Weekly' ? `${row.target} / week` : `${row.target} / month`;
-          const statusClass = status => ({'Ahead':'ahead','On Track':'track','Attention':'attention','Behind':'behind','Complete':'complete'}[status] || 'routine');
-          const urgency = {'Behind':0,'Attention':1,'On Track':2,'Ahead':3,'Complete':4,'Awaiting current-period data':5};
-          const metric = (name, value, detail) => `<div class="metric-card"><div class="metric-label">${name}</div><div class="metric-value">${value}</div><div class="metric-detail">${detail}</div></div>`;
-          const liveRows = live.length ? [...live].sort((a,b) => urgency[a.status] - urgency[b.status] || a.client.localeCompare(b.client) || a.platform.localeCompare(b.platform)).map(row => {
-            const completion = row.published == null || row.target == null ? '—' : `${Math.round(row.published / row.target * 100)}%`;
-            const width = row.published == null || row.target == null ? 0 : Math.min(100, row.published / row.target * 100);
-            const publishedTarget = row.published == null ? `— / ${row.target}` : `${row.published} / ${row.target}`;
-            return `<tr><td>${esc(row.client)}</td><td>${esc(row.platform)}</td><td>${completion}<div class="progress-track"><div class="progress-fill ${statusClass(row.status)}" style="width:${width}%"></div></div></td><td>${esc(publishedTarget)}</td><td>${esc(row.owner)}</td><td><span class="tag ${statusClass(row.status)}">${esc(row.status)}</span></td></tr>`;
-          }).join('') : '<tr><td colspan="6" class="inactive">Awaiting current-period setup.</td></tr>';
-          const progressWidth = overall == null ? 0 : Math.min(100, overall * 100);
-          const completionDisplay = overall == null ? '—' : `${Math.round(overall * 100)}%`;
-          const progressDetail = allReported ? `${totalPublished} / ${totalTarget} Posts` : `— / ${totalTarget} Posts · ${awaiting} awaiting data`;
-          const countDisplay = status => withData.length ? `${counts[status]} platforms` : '— platforms';
-          const liveSection = `<section id="publishing-progress"><h2>Publishing Progress</h2><p class="section-note">Current weekly and monthly delivery only. Historical cumulative reporting appears below.</p><div class="metric-card"><div class="metric-label">Overall Posting Progress</div><div class="metric-value">${completionDisplay}</div><div class="metric-detail">${progressDetail}</div><div class="overall-progress"><div class="progress-fill track" style="width:${progressWidth}%"></div></div></div><h3 style="font-size:13px;margin:18px 0 8px;">Status Summary</h3><div class="kpi-grid">${metric('On Track', countDisplay('On Track'), 'Meeting expected pace')}${metric('Attention', countDisplay('Attention'), 'Below expected pace')}${metric('Behind', countDisplay('Behind'), 'Needs follow-up')}${metric('Ahead', countDisplay('Ahead'), 'Ahead of expected pace')}</div><div class="table-wrap"><table><thead><tr><th>Client</th><th>Platform</th><th>Progress</th><th>Published / Target</th><th>Owner</th><th>Status</th></tr></thead><tbody>${liveRows}</tbody></table></div></section>`;
-          const historyRows = historical.map(row => {
-            const p = row.properties || {}, published = number(p.Published), target = number(p.Target);
-            const completion = published == null || target == null ? '—' : `${Math.round(published / target * 100)}%`;
-            const range = p['Target Range']?.rich_text?.map(item => item.plain_text).join('') || '';
-            return `<tr><td>${esc(title(p.Client))}</td><td>${esc(select(p.Platform))}</td><td>${esc(date(p['Tracking Start']) || '—')}</td><td>${esc(date(p['Tracking End']) || '—')}</td><td>${esc(published ?? '—')}</td><td>${esc(target == null ? (range || '—') : target)}</td><td>${completion}</td></tr>`;
-          }).join('') || '<tr><td colspan="7" class="inactive">No historical publishing records available.</td></tr>';
-          const historySection = `<section id="historical-publishing-performance"><h2>Historical Publishing Performance</h2><p class="section-note">Cumulative contract and YTD reference data. It does not indicate current-period pace.</p><div class="table-wrap"><table><thead><tr><th>Client</th><th>Platform</th><th>Tracking Start</th><th>Tracking End</th><th>Published</th><th>Target</th><th>Completion</th></tr></thead><tbody>${historyRows}</tbody></table></div></section>`;
-          let html = fs.readFileSync('_site/index.html', 'utf8');
-          html = html.replace(/<section id="publishing-progress">[\s\S]*?<\/section>/, liveSection);
-          html = html.replace(/<section id="historical-publishing-performance">[\s\S]*?<\/section>/, historySection);
-          fs.writeFileSync('_site/index.html', html);
+          const get = name => JSON.parse(fs.readFileSync(name + '.json', 'utf8')).results || [];
+          const [current, historical, projects, workstreams] = ['current','historical','projects','workstreams'].map(get);
+          const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+          const title = p => (p?.title || []).map(x => x.plain_text || '').join('');
+          const text = p => (p?.rich_text || []).map(x => x.plain_text || '').join('');
+          const select = p => p?.select?.name || '';
+          const num = p => p?.number ?? null;
+          const date = p => p?.date?.start || '';
+          const alias = n => ({AO:'Arabian Oud', DDR:'DDR Museum'}[n] || n);
+          const now = new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',weekday:'short'}).formatToParts(new Date()).reduce((o,x)=>(o[x.type]=x.value,o),{});
+          const year=+now.year, month=+now.month, day=+now.day, weekday=({Mon:1,Tue:2,Wed:3,Thu:4,Fri:5,Sat:6,Sun:7})[now.weekday];
+          const todayMonth=`${now.year}-${now.month}-01`, daysInMonth=new Date(Date.UTC(year,month,0)).getUTCDate();
+          const monday=new Date(Date.UTC(year,month-1,day-Math.min(weekday,7)+1)).toISOString().slice(0,10);
+          const statusClass=s=>({Ahead:'ahead','On Track':'track',Attention:'attention',Behind:'behind',Complete:'complete',Priority:'priority','In Progress':'progress',Waiting:'waiting',Upcoming:'waiting',Closed:'closed'})[s]||'routine';
+          const tag=s=>`<span class="tag ${statusClass(s)}">${esc(s || '—')}</span>`;
+          const progress = row => { const p=row.properties||{}, period=select(p['Posting Period']), label=date(p['Period Label']), target=num(p.Target), published=num(p.Published); const active=select(p['Active / Inactive'])==='Active', isCurrent=period==='Monthly'?label===todayMonth:period==='Weekly'&&label===monday; const expected=target==null?null:period==='Weekly'?Math.min(target,target*Math.min(weekday,5)/5):Math.min(target,target*day/daysInMonth); let status='Awaiting Data'; if(published!=null&&target!=null){ if(published>=target)status='Complete'; else if(published>=expected*1.1)status='Ahead'; else if(published>=expected*.9)status='On Track'; else if(published>=expected*.8)status='Attention'; else status='Behind'; } return {client:alias(title(p.Client)),platform:select(p.Platform),period,label,target,published,expected,status,owner:select(p.Owner)||'—',active,isCurrent}; };
+          const live=current.map(progress).filter(r=>r.active&&r.isCurrent);
+          const reported=live.filter(r=>r.published!=null&&r.target!=null), totalTarget=live.reduce((n,r)=>n+(r.target||0),0), totalPublished=reported.reduce((n,r)=>n+r.published,0), allReported=live.length>0&&live.length===reported.length, overall=allReported&&totalTarget?totalPublished/totalTarget:null;
+          const urgency={Behind:0,Attention:1,'On Track':2,Ahead:3,Complete:4,'Awaiting Data':5};
+          const counts=Object.fromEntries(['On Track','Attention','Behind','Ahead'].map(s=>[s,reported.filter(r=>r.status===s).length]));
+          const metric=(name,value,detail)=>`<div class="metric-card"><div class="metric-label">${name}</div><div class="metric-value">${value}</div><div class="metric-detail">${detail}</div></div>`;
+          const projectRows=projects.map(row=>{const p=row.properties||{};return {id:row.id,project:title(p.Project),client:alias(title(p.Client)),status:select(p.Status),phase:select(p.Phase),priority:select(p.Priority),owner:select(p.Owner)||'—',focus:text(p['Current Focus']),next:text(p['Next Step']),waiting:text(p['Waiting For']),attention:p['Needs Attention']?.checkbox===true};});
+          const clientOf=id=>projectRows.find(p=>p.id===id)?.project||'Unlinked client';
+          const streamRows=workstreams.map(row=>{const p=row.properties||{};return {client:clientOf((p.Client?.relation||[])[0]?.id),workstream:title(p.Workstream),owner:select(p.Owner)||'Unassigned',status:select(p.Status),reviewer:select(p.Reviewer),needsReview:p['Needs Review']?.checkbox===true,due:date(p['Due Date'])};});
+          const activeProjects=projectRows.filter(p=>!['Closed','Waiting','Upcoming'].includes(p.status)&&!['Closed','Waiting Brief','Waiting / Blocked'].includes(p.phase));
+          const waiting=projectRows.filter(p=>p.waiting||['Waiting','Blocked','Upcoming'].includes(p.status)||['Waiting Brief','Waiting / Blocked'].includes(p.phase));
+          const priority=projectRows.filter(p=>p.status==='Priority'||p.priority==='High'||p.attention||['Waiting Brief','Waiting / Blocked'].includes(p.phase));
+          const clientPosting=name=>{const rows=live.filter(r=>r.client===alias(name));if(!rows.length)return 'No current KPI';return rows.some(r=>r.status==='Awaiting Data')?'Awaiting Data':[...rows].sort((a,b)=>urgency[a.status]-urgency[b.status])[0].status};
+          const ownerName=o=>o==='Mixed'?'Noemi + Intern':o;
+          const executive=`<section><h2>Executive Summary</h2><div class="kpi-grid executive-grid">${metric('Priority Projects',priority.length,priority.length?'Direct attention required':'No priority projects flagged')}${metric('Active Accounts',activeProjects.length,'Active delivery accounts')}${metric('Waiting / Blocked',waiting.length,waiting.length?'Dependencies requiring follow-up':'No active dependencies')}${metric('Current Posting Completion',overall==null?'—':`${Math.round(overall*100)}%`,allReported?`${totalPublished} / ${totalTarget} posts`:`${live.length-reported.length} platform${live.length-reported.length===1?'':'s'} awaiting data`) }${metric('Platforms Behind',reported.filter(r=>r.status==='Behind').length,reported.length?'Schedule-based pace':'Awaiting current-period data')}</div></section>`;
+          const focusPriority=priority.slice(0,3).map(p=>p.project).join(', ')||'No projects currently flagged';
+          const focusWaiting=waiting.slice(0,3).map(p=>p.project).join(', ')||'No dependencies currently recorded';
+          const weekly=`<section><h2>Weekly Focus</h2><div class="summary"><ul><li><strong>Priority attention:</strong> ${esc(focusPriority)}.</li><li><strong>Dependencies to move:</strong> ${esc(focusWaiting)}.</li><li><strong>Publishing pace:</strong> ${reported.length?`${counts.Behind} behind, ${counts.Attention} need attention, and ${counts['On Track']} on track.`:`Awaiting current-period publishing data.`}</li></ul></div></section>`;
+          const liveRows=live.length?[...live].sort((a,b)=>urgency[a.status]-urgency[b.status]||a.client.localeCompare(b.client)||a.platform.localeCompare(b.platform)).map(r=>{const pct=r.published==null||r.target==null?'—':`${Math.round(r.published/r.target*100)}%`,width=r.published==null||r.target==null?0:Math.min(100,r.published/r.target*100);return `<tr><td>${esc(r.client)}</td><td>${esc(r.platform)}</td><td>${pct}<div class="progress-track"><div class="progress-fill ${statusClass(r.status)}" style="width:${width}%"></div></div></td><td>${r.published==null?'—':esc(r.published)} / ${esc(r.target??'—')}</td><td>${esc(ownerName(r.owner))}</td><td>${tag(r.status)}</td></tr>`}).join(''):'<tr><td colspan="6" class="inactive">Awaiting current-period setup.</td></tr>';
+          const publishing=`<section id="publishing-progress"><h2>Publishing Progress</h2><p class="section-note">Current weekly and monthly delivery only. Historical cumulative reporting appears below.</p><div class="metric-card"><div class="metric-label">Overall Posting Progress</div><div class="metric-value">${overall==null?'—':`${Math.round(overall*100)}%`}</div><div class="metric-detail">${allReported?`${totalPublished} / ${totalTarget} Posts`:`— / ${totalTarget} Posts · ${live.length-reported.length} awaiting data`}</div><div class="overall-progress"><div class="progress-fill track" style="width:${overall==null?0:Math.min(100,overall*100)}%"></div></div></div><h3 style="font-size:13px;margin:18px 0 8px;">Status Summary</h3><div class="kpi-grid">${metric('On Track',reported.length?`${counts['On Track']} platforms`:'— platforms','Meeting expected pace')}${metric('Attention',reported.length?`${counts.Attention} platforms`:'— platforms','Below expected pace')}${metric('Behind',reported.length?`${counts.Behind} platforms`:'— platforms','Needs follow-up')}${metric('Ahead',reported.length?`${counts.Ahead} platforms`:'— platforms','Ahead of expected pace')}</div><div class="table-wrap"><table><thead><tr><th>Client</th><th>Platform</th><th>Progress</th><th>Published / Target</th><th>Owner</th><th>Status</th></tr></thead><tbody>${liveRows}</tbody></table></div></section>`;
+          const priorityRows=priority.length?priority.map(p=>`<tr><td>${esc(p.project)}</td><td>${tag(p.status)}</td><td>${esc(p.phase||'—')}</td><td>${esc(p.focus||'—')}</td><td>${esc(p.next||'—')}</td><td>${esc(ownerName(p.owner))}</td></tr>`).join(''):'<tr><td colspan="6" class="inactive">No priority projects currently flagged.</td></tr>';
+          const priorities=`<section><h2>Priority Projects</h2><p class="section-note">Strategic, launch, dependency, or attention-required projects only.</p><div class="table-wrap"><table><thead><tr><th>Project</th><th>Status</th><th>Phase</th><th>Current Focus</th><th>Next Step</th><th>Owner</th></tr></thead><tbody>${priorityRows}</tbody></table></div></section>`;
+          const waitRows=waiting.length?waiting.map(p=>`<tr><td>${esc(p.project)}</td><td>${esc(p.waiting||'Not recorded')}</td><td>Not recorded</td><td>${esc(p.next||'Not recorded')}</td><td>${esc(p.phase==='Waiting Brief'?'Launch blocked':p.status==='Waiting'?'Delivery paused':'Needs attention')}</td></tr>`).join(''):'<tr><td colspan="5" class="inactive">No waiting or blocked items recorded.</td></tr>';
+          const waits=`<section><h2>Waiting / Blocked</h2><div class="table-wrap"><table><thead><tr><th>Project</th><th>Waiting For</th><th>Since</th><th>Next Follow-up</th><th>Impact</th></tr></thead><tbody>${waitRows}</tbody></table></div></section>`;
+          const clientRows=activeProjects.map(p=>`<tr><td>${esc(p.project)}</td><td>${tag(p.status)}</td><td>${esc(p.phase||'—')}</td><td>${tag(clientPosting(p.project))}</td><td>${esc(ownerName(p.owner))}</td><td>${esc(p.next||'—')}</td></tr>`).join('')||'<tr><td colspan="6" class="inactive">No active clients recorded.</td></tr>';
+          const clients=`<section><h2>Active Client Overview</h2><div class="table-wrap"><table><thead><tr><th>Client</th><th>Overall Status</th><th>Current Phase</th><th>Posting Status</th><th>Owner</th><th>Next Step</th></tr></thead><tbody>${clientRows}</tbody></table></div></section>`;
+          const activeStreams=streamRows.filter(s=>!['Completed','Waiting'].includes(s.status));
+          const ownership=owner=>{const groups={};activeStreams.filter(s=>s.owner===owner).forEach(s=>(groups[s.client]??=[]).push(s.workstream));return Object.entries(groups).map(([client,tasks])=>`<li><strong>${esc(client)}:</strong> ${esc(tasks.join(', '))}</li>`).join('')||'<li class="inactive">No active workstreams recorded.</li>'};
+          const execution=`<section><h2>Execution Ownership</h2><div class="ownership-grid"><div class="ownership-card"><h3>Noemi</h3><ul>${ownership('Noemi')}</ul></div><div class="ownership-card"><h3>Intern</h3><ul>${ownership('Intern')}</ul></div></div></section>`;
+          const weekEnd=new Date(Date.UTC(year,month-1,day-Math.min(weekday,7)+7)).toISOString().slice(0,10);
+          const completed=streamRows.filter(s=>s.status==='Completed'&&s.due&&s.due>=monday&&s.due<=weekEnd);
+          const completedHtml=completed.length?`<div class="table-wrap"><table><thead><tr><th>Client</th><th>Workstream</th><th>Owner</th></tr></thead><tbody>${completed.map(s=>`<tr><td>${esc(s.client)}</td><td>${esc(s.workstream)}</td><td>${esc(ownerName(s.owner))}</td></tr>`).join('')}</tbody></table></div>`:'<p class="inactive">No meaningful completed milestones recorded this week.</p>';
+          const completedSection=`<section><h2>Completed This Week</h2>${completedHtml}</section>`;
+          const historyRows=historical.map(row=>{const p=row.properties||{},published=num(p.Published),target=num(p.Target),range=text(p['Target Range']),completion=published==null||target==null?'—':`${Math.round(published/target*100)}%`;return `<tr><td>${esc(alias(title(p.Client)))}</td><td>${esc(select(p.Platform))}</td><td>${esc(date(p['Tracking Start'])||'—')}</td><td>${esc(date(p['Tracking End'])||'—')}</td><td>${esc(published??'—')}</td><td>${esc(target==null?(range||'—'):target)}</td><td>${completion}</td></tr>`}).join('')||'<tr><td colspan="7" class="inactive">No historical publishing records available.</td></tr>';
+          const history=`<section id="historical-publishing-performance"><h2>Historical Publishing Performance</h2><p class="section-note">Cumulative contract and YTD reference data. It does not indicate current-period pace.</p><div class="table-wrap"><table><thead><tr><th>Client</th><th>Platform</th><th>Tracking Start</th><th>Tracking End</th><th>Published</th><th>Target</th><th>Completion</th></tr></thead><tbody>${historyRows}</tbody></table></div></section>`;
+          const dashboard=executive+weekly+publishing+priorities+waits+clients+execution+completedSection+history;
+          let html=fs.readFileSync('_site/index.html','utf8');
+          html=html.replace(/<div id="manager-dashboard">[\s\S]*?<\/div>/,`<div id="manager-dashboard">${dashboard}</div>`);
+          html=html.replace(/<div data-legacy class="summary">[\s\S]*?<\/div>/,'').replace(/<section data-legacy[\s\S]*?<\/section>/g,'');
+          fs.writeFileSync('_site/index.html',html);
           NODE
-
-      - name: Upload site
-        uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v3
         with:
           path: _site
-
-      - name: Publish to GitHub Pages
-        id: deployment
+      - id: deployment
         uses: actions/deploy-pages@v4
